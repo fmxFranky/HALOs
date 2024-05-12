@@ -15,7 +15,6 @@ The trainer for each loss should subclass either PairedPreferenceTrainer or Unpa
 """
 
 import torch
-torch.backends.cuda.matmul.allow_tf32 = True
 import torch.nn.functional as F
 import torch.nn as nn
 import transformers
@@ -63,6 +62,7 @@ import time
 import json
 import functools
 from typing import Optional, Dict, List, Union, Tuple
+torch.backends.cuda.matmul.allow_tf32 = True
 
 
 class BasicTrainer(object):
@@ -785,8 +785,8 @@ class ORPOTrainer(PairedPreferenceTrainer):
         metrics[f'loss/{mode}'] = all_devices_losses.float().cpu().numpy().tolist()
 
         del chosen_rewards, rejected_rewards, reward_accuracies, policy_chosen_logps, policy_rejected_logps, all_devices_losses
-        if self.reference_model:
-            del reference_chosen_logps, reference_rejected_logps
+        # if self.reference_model:
+        #     del reference_chosen_logps, reference_rejected_logps
 
         return losses.mean(), metrics
 

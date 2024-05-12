@@ -1,0 +1,9 @@
+# Supervised Finetuning
+name: rm
+
+trainer: RewardModelTrainer
+
+dataloader: PairedPreferenceDataLoader
+
+loss_type: 'sequence-wise'
+regularization: 0.001

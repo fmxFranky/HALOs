@@ -202,7 +202,7 @@ class ValueHead(nn.Module):
     The weights of the value head need to be in FP32.
     """
 
-    def __init__(self, config, **kwargs):
+    def __init__(self, config, freeze_llm_backbone=True, **kwargs):
         super().__init__()
         if not hasattr(config, "summary_dropout_prob"):
             summary_dropout_prob = kwargs.pop("summary_dropout_prob", 0.1)
@@ -214,22 +214,26 @@ class ValueHead(nn.Module):
             hidden_size = config.word_embed_proj_dim
         else:
             hidden_size = config.hidden_size
+        print(f"value head hidden_size: {hidden_size}")
 
-        self.summary = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            nn.Dropout(summary_dropout_prob) if summary_dropout_prob else nn.Identity(),
-            nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size),
-            nn.Dropout(summary_dropout_prob) if summary_dropout_prob else nn.Identity(),
-            nn.ReLU(),
-            nn.Linear(hidden_size, 1)    
-        )
-        self.flatten = nn.Flatten()
+        # self.summary = nn.Sequential(
+        #     nn.Linear(hidden_size, hidden_size),
+        #     nn.Dropout(summary_dropout_prob) if summary_dropout_prob else nn.Identity(),
+        #     nn.ReLU(),
+        #     nn.Linear(hidden_size, hidden_size),
+        #     nn.Dropout(summary_dropout_prob) if summary_dropout_prob else nn.Identity(),
+        #     nn.ReLU(),
+        #     nn.Linear(hidden_size, 1)    
+        # )
+        # self.flatten = nn.Flatten()
+        self.summary = nn.Linear(hidden_size, 1, bias=False)
+        self.freeze_lm_backbone = freeze_llm_backbone
 
     def forward(self, hidden_states):
         # detach so that loss isn't backproped through LM
         # upcast since fp32 is important for good value predictions
-        hidden_states = hidden_states.detach().to(torch.float32)
+        if self.freeze_lm_backbone:
+            hidden_states = hidden_states.detach().to(torch.float32)
         output = self.summary(hidden_states)
         return output
 

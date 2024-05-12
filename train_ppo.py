@@ -23,15 +23,12 @@ Remember to allocate enough RAM before running this (you need aroundd 800 GB for
 import gc
 import json
 import os
-import random
 import resource
 import socket
 from typing import Optional, Set
 
 import hydra
-import numpy as np
 import torch
-import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 import wandb
@@ -39,7 +36,8 @@ from omegaconf import DictConfig, OmegaConf
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 
 import dataloader
-import trainers
+import ppo_models
+import rl_trainers
 from models import AutoModelForCausalLMWithValueHead
 from utils import delete_dict, disable_dropout, get_open_port, init_distributed
 
@@ -65,7 +63,7 @@ def worker_main(rank: int, world_size: int, config: DictConfig, tokenizer: AutoT
             name=config.exp_name,
         )
 
-    TrainerClass = getattr(trainers, config.loss.trainer)
+    TrainerClass = getattr(rl_trainers, config.loss.trainer)
     print(f'Creating trainer on process {rank} with world size {world_size}')
 
     trainer = TrainerClass(
@@ -123,6 +121,8 @@ def main(config: DictConfig):
     print('=' * 80)
     
     policy_kwargs = {'torch_dtype' : getattr(torch, config.model.policy_dtype)}
+    reward_model_kwargs = {'torch_dtype' : getattr(torch, config.model.reward_model_dtype)}
+    critic_kwargs = {'torch_dtype' : getattr(torch, config.model.critic_dtype)}
     reference_kwargs = {'torch_dtype' : getattr(torch, config.model.reference_dtype)}
     
     if not config.use_fsdp:
@@ -130,38 +130,50 @@ def main(config: DictConfig):
         reference_kwargs['device_map'] = 'balanced'
 
     print('building policy')
-    model_class = AutoModelForCausalLMWithValueHead if config.loss.name == 'ppo' else AutoModelForCausalLM
-    policy = model_class.from_pretrained(
+    # model_class = AutoModelForCausalLMWithValueHead if config.loss.name == 'ppo' else AutoModelForCausalLM
+    policy = AutoModelForCausalLM.from_pretrained(
         config.model.name_or_path, low_cpu_mem_usage=True, use_flash_attention_2=config.model.use_flash_attention, **policy_kwargs)
     disable_dropout(policy)
+    print('building reward model')
+    reward_model = ppo_models.RewardModel(config.model.reward_model_name_or_path, low_cpu_mem_usage=True, use_flash_attention_2=config.model.use_flash_attention, **reward_model_kwargs)
+    disable_dropout(reward_model)
+    print('building critic')
+    critic = ppo_models.Critic(config.model.name_or_path, low_cpu_mem_usage=True, use_flash_attention_2=config.model.use_flash_attention, **critic_kwargs)
+    disable_dropout(critic)
+    print('building reference model')
+    reference_model = AutoModelForCausalLM.from_pretrained(
+        config.model.name_or_path, low_cpu_mem_usage=True, use_flash_attention_2=config.model.use_flash_attention, **reference_kwargs)
+    disable_dropout(reference_model)
 
-    if config.loss.use_reference_model:
-        print('building reference model')
-        reference_model = AutoModelForCausalLM.from_pretrained(
-            config.model.name_or_path, low_cpu_mem_usage=True, use_flash_attention_2=config.model.use_flash_attention, **reference_kwargs)
-        disable_dropout(reference_model)
-    else:
-        reference_model = None
 
-    if config.model.load_from is not None:
-        state_dict = torch.load(os.path.join(config.cache_dir, config.model.load_from), map_location='cpu')
+    if config.model.load_policy_from is not None:
+        state_dict = torch.load(os.path.join(config.cache_dir, config.model.load_policy_from), map_location='cpu')
         step, metrics = state_dict['step_idx'], state_dict['metrics']
-        print(f'loading pre-trained weights at step {step} from {config.model.load_from} with metrics {json.dumps(metrics, indent=2)}')
+        print(f'loading pre-trained weights of POLICY at step {step} from {config.model.load_policy_from} with metrics {json.dumps(metrics, indent=2)}')
 
-        if config.loss.name == 'ppo':
-            policy.pretrained_model.load_state_dict(state_dict['state'])
-            if config.loss.use_reference_model:
-                reference_model.load_state_dict(state_dict['state'])
-        else:
-            policy.load_state_dict(state_dict['state'])
-            if config.loss.use_reference_model:
-                reference_model.load_state_dict(state_dict['state'])
+        policy.load_state_dict(state_dict['state'])
+        # critic.pretrained_model.load_state_dict(state_dict['state'])
+        reference_model.load_state_dict(state_dict['state'])
 
         delete_dict(state_dict)
         gc.collect()
         torch.cuda.empty_cache()
 
-        print('loaded pre-trained weights')
+        print('loaded POLICY/REF_POLICY pre-trained weights')
+    
+    if config.model.load_reward_model_from is not None:
+        state_dict = torch.load(os.path.join(config.cache_dir, config.model.load_reward_model_from), map_location='cpu')
+        step, metrics = state_dict['step_idx'], state_dict['metrics']
+        print(f'loading pre-trained weights of RM at step {step} from {config.model.load_reward_model_from} with metrics {json.dumps(metrics, indent=2)}')
+
+        reward_model.load_state_dict(state_dict['state'])
+        critic.load_state_dict(state_dict['state'])
+
+        delete_dict(state_dict)
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        print('loaded RM/CRITIC pre-trained weights')
 
     tokenizer_name_or_path = config.model.tokenizer_name_or_path or config.model.name_or_path
     print(f'Loading tokenizer {tokenizer_name_or_path}')
@@ -173,12 +185,12 @@ def main(config: DictConfig):
     special_tokens = [ config.loss.chosen_control_token, config.loss.rejected_control_token ] if config.loss.name == 'csft' else []
     num_added = tokenizer.add_special_tokens({ "additional_special_tokens" : special_tokens })
     if special_tokens != []:
-        if config.loss.name == 'ppo':
-            # for PPO, policy and reference must tokenize the same way
-            policy.pretrained_model.resize_token_embeddings(len(tokenizer))
-            reference_model.resize_token_embeddings(len(tokenizer))
-        else:
-            policy.resize_token_embeddings(len(tokenizer))
+        # Currently, all models must tokenize the same way
+        policy.pretrained_model.resize_token_embeddings(len(tokenizer))
+        reference_model.resize_token_embeddings(len(tokenizer))
+        reward_model.resize_token_embeddings(len(tokenizer))
+        critic.resize_token_embeddings(len(tokenizer))
+
 
     print(f"{num_added} special tokens added")
 
